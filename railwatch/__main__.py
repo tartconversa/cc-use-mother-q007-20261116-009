@@ -30,9 +30,18 @@ def parser():
     snapshot.add_argument("name")
     snapshot.add_argument("--project-key")
     show = commands.add_parser("show")
-    show.add_argument("kind", choices=["scopes", "audit", "claims", "snapshot"])
+    show.add_argument("kind", choices=["scopes", "audit", "claims", "snapshot", "anomalies"])
     show.add_argument("--id", type=int)
     show.add_argument("--project-key")
+    anomaly_config = commands.add_parser("anomaly-config")
+    anomaly_config.add_argument("config_json")
+    anomaly_config.add_argument("--expected-version", type=int)
+    anomaly_scan = commands.add_parser("anomaly-scan")
+    anomaly_scan.add_argument("--project-key")
+    anomaly_scan.add_argument("--metric")
+    anomaly_review = commands.add_parser("anomaly-review")
+    anomaly_review.add_argument("anomaly_id", type=int)
+    anomaly_review.add_argument("decision_json")
     return root
 
 
@@ -47,6 +56,12 @@ def execute(args):
         return runner.run_path(args.manifest, args.offset, args.limit, args.stop_on_error)
     if args.command == "review":
         return service.review(args.claim_id, json.loads(args.decision_json))
+    if args.command == "anomaly-config":
+        return service.anomalies.put_config(json.loads(args.config_json), args.expected_version)
+    if args.command == "anomaly-scan":
+        return service.anomalies.scan(args.project_key, args.metric)
+    if args.command == "anomaly-review":
+        return service.anomalies.review(args.anomaly_id, json.loads(args.decision_json))
     if args.command == "snapshot":
         return service.publish({"name": args.name, "project_key": args.project_key})
     if args.kind == "scopes":
@@ -55,6 +70,8 @@ def execute(args):
         return service.audit()
     if args.kind == "claims":
         return service.review_queue(args.project_key)
+    if args.kind == "anomalies":
+        return service.anomalies.queue(args.project_key)
     if args.id is None:
         raise ProductError("missing_id", "snapshot requires --id")
     return service.snapshot(args.id)

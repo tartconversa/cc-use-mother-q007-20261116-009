@@ -56,6 +56,21 @@ class PublishInput(StrictModel):
     project_key: str | None = None
 
 
+class AnomalyConfigInput(StrictModel):
+    project_key: str
+    metric: str
+    ratio: str | int | float = "3"
+    active: bool = True
+    expected_version: int | None = None
+
+
+class AnomalyReviewInput(StrictModel):
+    action: str
+    reviewer: str
+    reason: str
+    expected_version: int
+
+
 class BatchInput(StrictModel):
     captures: list[CaptureInput]
     stop_on_error: bool = False
@@ -191,6 +206,48 @@ def create_app(db_path=None):
     @app.get("/quality/outliers/{project_key}/{metric}")
     def outliers(project_key: str, metric: str, ratio: str = "3"):
         return Quality(service).outliers(project_key, metric, ratio)
+
+    @app.put("/anomaly/config")
+    def put_anomaly_config(body: AnomalyConfigInput):
+        value = body.model_dump()
+        expected = value.pop("expected_version")
+        return service.anomalies.put_config(value, expected)
+
+    @app.get("/anomaly/config/{project_key}/{metric}")
+    def get_anomaly_config(project_key: str, metric: str):
+        config = service.anomalies.get_config(project_key, metric)
+        if config is None:
+            raise ProductError("unknown_config", "anomaly config is not registered", 404)
+        return config
+
+    @app.get("/anomaly/configs")
+    def list_anomaly_configs(project_key: str | None = None):
+        return service.anomalies.list_configs(project_key)
+
+    @app.post("/anomaly/scan")
+    def scan_anomalies(body: dict | None = None):
+        body = body or {}
+        project_key = body.get("project_key")
+        metric = body.get("metric")
+        return service.anomalies.scan(project_key, metric)
+
+    @app.get("/anomaly/items")
+    def anomaly_queue(project_key: str | None = None, metric: str | None = None,
+                      state: str | None = None):
+        return service.anomalies.queue(project_key, metric, state)
+
+    @app.get("/anomaly/items/{anomaly_id}")
+    def get_anomaly(anomaly_id: int):
+        return service.anomalies.get(anomaly_id)
+
+    @app.get("/anomaly/items/{anomaly_id}/events")
+    def get_anomaly_events(anomaly_id: int):
+        service.anomalies.store.anomaly(anomaly_id)
+        return service.anomalies.store.anomaly_events(anomaly_id)
+
+    @app.post("/anomaly/items/{anomaly_id}/reviews")
+    def review_anomaly(anomaly_id: int, body: AnomalyReviewInput):
+        return service.anomalies.review(anomaly_id, body.model_dump())
 
     @app.post("/jobs")
     def post_job(body: dict):

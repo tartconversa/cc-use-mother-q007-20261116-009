@@ -16,6 +16,14 @@ class RailwayService:
         self.store = Store(db_path)
         self.schedule = Schedule(self.store)
         self.extractor = Extractor()
+        self._anomalies = None
+
+    @property
+    def anomalies(self):
+        if self._anomalies is None:
+            from .anomaly import AnomalyService
+            self._anomalies = AnomalyService(self)
+        return self._anomalies
 
     def register_source(self, data, expected_version=None):
         policy = SourcePolicy.parse(data)
@@ -44,6 +52,7 @@ class RailwayService:
             self.store.set_capture_state(capture_id, "received", "quarantined", {"issues": issues})
             return {"capture_id": capture_id, "created": created, "state": "quarantined", "claim_ids": [], "issues": issues}
         claim_ids = self.store.insert_claims(capture_id, claims)
+        self.anomalies.after_claims_ingested(claim_ids)
         return {"capture_id": capture_id, "created": created, "state": "parsed", "claim_ids": claim_ids, "issues": []}
 
     def capture(self, capture_id):
@@ -122,6 +131,7 @@ class RailwayService:
             accepted.append({**claim, "trust_rank": self.store.source(capture["source_id"])["trust_rank"]})
         selected, conflict = self._selection(accepted)
         scope = self.store.record_review(claim_id, decision, reviewer, reason.strip(), expected, selected, conflict)
+        self.anomalies.after_review(claim_id)
         return {"claim_id": claim_id, "decision": decision, "scope": scope}
 
     def _selection(self, accepted):
@@ -166,9 +176,17 @@ class RailwayService:
         blocked = [row for row in scopes if row["conflict"] or row["selected"] is None]
         if blocked:
             raise ProductError("unresolved_scope", f"{len(blocked)} scopes are unresolved", 409)
-        row, created = self.store.save_snapshot(name, scopes)
+        anomaly_blockers = self.anomalies.blocking(project_key)
+        if anomaly_blockers:
+            keys = sorted({(item["project_key"], item["kind"], item["metric"],
+                            item["after"]["period"]) for item in anomaly_blockers})
+            raise ProductError("anomaly_unresolved",
+                               f"{len(anomaly_blockers)} anomaly review items are unresolved", 409)
+        frozen_anomalies = [self.anomalies.compact(item) for item in self.anomalies.freeze(project_key)]
+        row, created = self.store.save_snapshot(name, scopes, frozen_anomalies)
         return {"snapshot_id": row["id"], "digest": row["digest"], "created": created,
-                "scope_count": row["scope_count"], "claim_count": row["claim_count"]}
+                "scope_count": row["scope_count"], "claim_count": row["claim_count"],
+                "anomaly_count": len(frozen_anomalies)}
 
     def snapshot(self, snapshot_id):
         return self.store.snapshot(snapshot_id)

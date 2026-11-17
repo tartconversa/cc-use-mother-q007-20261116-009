@@ -49,8 +49,35 @@ CREATE TABLE IF NOT EXISTS scopes (
 CREATE TABLE IF NOT EXISTS snapshots (
  id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL,
  digest TEXT NOT NULL UNIQUE, scope_count INTEGER NOT NULL, claim_count INTEGER NOT NULL,
- content_json TEXT NOT NULL
+ content_json TEXT NOT NULL, anomalies_json TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS anomaly_configs (
+ project_key TEXT NOT NULL, metric TEXT NOT NULL,
+ ratio TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+ active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ PRIMARY KEY(project_key,metric)
+);
+CREATE TABLE IF NOT EXISTS anomalies (
+ id INTEGER PRIMARY KEY, project_key TEXT NOT NULL, kind TEXT NOT NULL,
+ metric TEXT NOT NULL, unit TEXT NOT NULL,
+ before_claim INTEGER NOT NULL REFERENCES claims(id),
+ after_claim INTEGER NOT NULL REFERENCES claims(id),
+ before_period TEXT NOT NULL, after_period TEXT NOT NULL,
+ before_amount TEXT NOT NULL, after_amount TEXT NOT NULL,
+ observed_ratio TEXT, threshold_ratio TEXT NOT NULL,
+ config_version INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL,
+ resolution TEXT, reviewer TEXT, reason TEXT,
+ evidence_claim INTEGER REFERENCES claims(id),
+ context_hash TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+ UNIQUE(project_key,kind,metric,unit,before_claim,after_claim)
+);
+CREATE INDEX IF NOT EXISTS anomalies_lookup ON anomalies(project_key,metric,state);
+CREATE TABLE IF NOT EXISTS anomaly_events (
+ id INTEGER PRIMARY KEY, anomaly_id INTEGER NOT NULL REFERENCES anomalies(id),
+ event TEXT NOT NULL, reviewer TEXT, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS anomaly_events_lookup ON anomaly_events(anomaly_id,id);
 CREATE TABLE IF NOT EXISTS audit (
  id INTEGER PRIMARY KEY, event TEXT NOT NULL, subject TEXT NOT NULL,
  detail_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -79,6 +106,9 @@ class Store:
     def initialize(self):
         with closing(self.connect()) as db:
             db.executescript(SCHEMA)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(snapshots)").fetchall()}
+            if "anomalies_json" not in columns:
+                db.execute("ALTER TABLE snapshots ADD COLUMN anomalies_json TEXT NOT NULL DEFAULT '[]'")
 
     @contextmanager
     def transaction(self):
@@ -236,15 +266,17 @@ class Store:
             self.audit(db, "claim_reviewed", str(claim_id), {"decision": decision, "scope_version": version + 1})
         return self.scope(key)
 
-    def save_snapshot(self, name, scopes):
+    def save_snapshot(self, name, scopes, anomalies=None):
+        anomalies = anomalies or []
         content = canonical(scopes)
-        value = fingerprint(content)
+        value = fingerprint(canonical({"scopes": scopes, "anomalies": anomalies}))
         with self.transaction() as db:
             old = db.execute("SELECT * FROM snapshots WHERE digest=?", (value,)).fetchone()
             if old:
                 return dict(old), False
-            cursor = db.execute("INSERT INTO snapshots(name,created_at,digest,scope_count,claim_count,content_json) VALUES(?,?,?,?,?,?)",
-                                (name, now(), value, len(scopes), sum(bool(s["selected_claim"]) for s in scopes), content))
+            cursor = db.execute("INSERT INTO snapshots(name,created_at,digest,scope_count,claim_count,content_json,anomalies_json) VALUES(?,?,?,?,?,?,?)",
+                                (name, now(), value, len(scopes), sum(bool(s["selected_claim"]) for s in scopes),
+                                 content, canonical(anomalies)))
             self.audit(db, "snapshot_created", str(cursor.lastrowid), {"digest": value, "name": name})
             return dict(db.execute("SELECT * FROM snapshots WHERE id=?", (cursor.lastrowid,)).fetchone()), True
 
@@ -253,7 +285,140 @@ class Store:
         if row is None:
             raise ProductError("unknown_snapshot", "snapshot does not exist", 404)
         row["content"] = json.loads(row.pop("content_json"))
+        row["anomalies"] = json.loads(row.pop("anomalies_json", None) or "[]")
         return row
+
+    # 版本化异常阈值配置 -------------------------------------------------
+    def anomaly_config(self, project_key, metric):
+        row = self.one("SELECT * FROM anomaly_configs WHERE project_key=? AND metric=?", (project_key, metric))
+        if row is None:
+            return None
+        row["ratio"] = str(row["ratio"])
+        row["active"] = bool(row["active"])
+        return row
+
+    def anomaly_configs(self, project_key=None):
+        if project_key:
+            rows = self.all("SELECT * FROM anomaly_configs WHERE project_key=? ORDER BY project_key,metric", (project_key,))
+        else:
+            rows = self.all("SELECT * FROM anomaly_configs ORDER BY project_key,metric")
+        for row in rows:
+            row["ratio"] = str(row["ratio"])
+            row["active"] = bool(row["active"])
+        return rows
+
+    def upsert_anomaly_config(self, project_key, metric, ratio, active, expected_version=None):
+        ratio_text = str(ratio)
+        with self.transaction() as db:
+            old = db.execute("SELECT * FROM anomaly_configs WHERE project_key=? AND metric=?",
+                             (project_key, metric)).fetchone()
+            stamp = now()
+            if old:
+                if expected_version != old["version"]:
+                    raise ProductError("stale_version", "anomaly config version changed", 409)
+                version = old["version"] + 1
+                db.execute("UPDATE anomaly_configs SET ratio=?,version=?,active=?,updated_at=? WHERE project_key=? AND metric=?",
+                           (ratio_text, version, int(active), stamp, project_key, metric))
+                self.audit(db, "anomaly_config_updated", project_key + ":" + metric,
+                           {"old_version": old["version"], "new_version": version, "ratio": ratio_text})
+            else:
+                if expected_version is not None:
+                    raise ProductError("stale_version", "config does not exist yet", 409)
+                db.execute("INSERT INTO anomaly_configs(project_key,metric,ratio,version,active,created_at,updated_at) VALUES(?,?,?,1,?,?,?)",
+                           (project_key, metric, ratio_text, int(active), stamp, stamp))
+                version = 1
+                self.audit(db, "anomaly_config_created", project_key + ":" + metric, {"version": 1, "ratio": ratio_text})
+        return self.anomaly_config(project_key, metric)
+
+    # 核查事项 -----------------------------------------------------------
+    def anomaly(self, anomaly_id):
+        row = self.one("SELECT * FROM anomalies WHERE id=?", (anomaly_id,))
+        if row is None:
+            raise ProductError("unknown_anomaly", "anomaly review item does not exist", 404)
+        return row
+
+    def anomaly_ident(self, before_claim, after_claim):
+        row = self.one("SELECT * FROM anomalies WHERE before_claim=? AND after_claim=?", (before_claim, after_claim))
+        return row
+
+    def anomalies(self, project_key=None, metric=None, state=None):
+        clauses, args = [], []
+        if project_key:
+            clauses.append("project_key=?")
+            args.append(project_key)
+        if metric:
+            clauses.append("metric=?")
+            args.append(metric)
+        if state:
+            clauses.append("state=?")
+            args.append(state)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        return self.all("SELECT * FROM anomalies" + where + " ORDER BY id", args)
+
+    def insert_anomaly(self, item):
+        with self.transaction() as db:
+            cursor = db.execute(
+                "INSERT INTO anomalies(project_key,kind,metric,unit,before_claim,after_claim,before_period,after_period,before_amount,after_amount,observed_ratio,threshold_ratio,config_version,state,context_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (item["project_key"], item["kind"], item["metric"], item["unit"],
+                 item["before_claim"], item["after_claim"], item["before_period"], item["after_period"],
+                 item["before_amount"], item["after_amount"], item["observed_ratio"], item["threshold_ratio"],
+                 item["config_version"], item["state"], item["context_hash"], now(), now()))
+            anomaly_id = cursor.lastrowid
+            self.add_anomaly_event(db, anomaly_id, "opened", None,
+                                   {"threshold_ratio": item["threshold_ratio"], "config_version": item["config_version"]})
+            self.audit(db, "anomaly_opened", str(anomaly_id),
+                       {"project_key": item["project_key"], "metric": item["metric"],
+                        "before_claim": item["before_claim"], "after_claim": item["after_claim"]})
+        return anomaly_id
+
+    @staticmethod
+    def add_anomaly_event(db, anomaly_id, event, reviewer, detail):
+        db.execute("INSERT INTO anomaly_events(anomaly_id,event,reviewer,detail_json,created_at) VALUES(?,?,?,?,?)",
+                   (anomaly_id, event, reviewer, canonical(detail), now()))
+
+    def anomaly_events(self, anomaly_id):
+        rows = self.all("SELECT * FROM anomaly_events WHERE anomaly_id=? ORDER BY id", (anomaly_id,))
+        for row in rows:
+            row["detail"] = json.loads(row.pop("detail_json"))
+        return rows
+
+    def update_anomaly(self, anomaly_id, *, state=None, resolution=None, reviewer=None, reason=None,
+                       evidence_claim=None, config_version=None, threshold_ratio=None, event=None, event_detail=None):
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM anomalies WHERE id=?", (anomaly_id,)).fetchone()
+            if row is None:
+                raise ProductError("unknown_anomaly", "anomaly review item does not exist", 404)
+            fields, args = ["version=version+1", "updated_at=?"], [now()]
+            if state is not None:
+                fields.append("state=?")
+                args.append(state)
+            if resolution is not None:
+                fields.append("resolution=?")
+                args.append(resolution)
+            if reviewer is not None:
+                fields.append("reviewer=?")
+                args.append(reviewer)
+            if reason is not None:
+                fields.append("reason=?")
+                args.append(reason)
+            if evidence_claim is not None:
+                fields.append("evidence_claim=?")
+                args.append(evidence_claim)
+            if config_version is not None:
+                fields.append("config_version=?")
+                args.append(config_version)
+            if threshold_ratio is not None:
+                fields.append("threshold_ratio=?")
+                args.append(threshold_ratio)
+            args.append(anomaly_id)
+            db.execute("UPDATE anomalies SET " + ",".join(fields) + " WHERE id=?", args)
+            self.add_anomaly_event(db, anomaly_id, event or ("state_" + (state or row["state"])),
+                                   reviewer, event_detail or {})
+            if state is not None and state != row["state"]:
+                self.audit(db, "anomaly_state_changed", str(anomaly_id),
+                           {"from": row["state"], "to": state, "reviewer": reviewer})
+            updated = dict(db.execute("SELECT * FROM anomalies WHERE id=?", (anomaly_id,)).fetchone())
+        return updated
 
     def audit_events(self, since=0, limit=100):
         rows = self.all("SELECT * FROM audit WHERE id>? ORDER BY id LIMIT ?", (since, limit))

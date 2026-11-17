@@ -39,10 +39,13 @@ class Quality:
         conflicts = [self._scope_key(scope) for scope in scopes if scope["conflict"]]
         missing = [self._scope_key(scope) for scope in scopes if not scope["selected"]]
         retracted = [row["id"] for row in claims if row["state"] == "retracted"]
+        anomaly_state = Counter(row["state"] for row in self.service.store.anomalies(project_key))
         return {"project_key": project_key, "total_claims": len(claims), "states": dict(states),
                 "by_source": {key: dict(value) for key, value in sorted(by_source.items())},
                 "scopes": len(scopes), "conflicts": conflicts, "unselected": missing,
-                "retracted_claim_ids": retracted}
+                "retracted_claim_ids": retracted,
+                "anomaly_states": dict(anomaly_state),
+                "blocking_anomaly_ids": [row["anomaly_id"] for row in self.service.anomalies.blocking(project_key)]}
 
     def stale_reviews(self, project_key=None):
         scopes = self.service.scopes(project_key)
@@ -73,8 +76,21 @@ class Quality:
         scopes = self.service.scopes(project_key)
         unresolved = [self._scope_key(scope) for scope in scopes if scope["conflict"] or not scope["selected"]]
         stale = self.stale_reviews(project_key)
-        return {"ready": bool(scopes) and not unresolved and not stale,
-                "scope_count": len(scopes), "unresolved": unresolved, "stale_reviews": stale}
+        blockers = self.service.anomalies.blocking(project_key)
+        anomaly_keys = [self._scope_key_from_tuple(*key) for key in sorted(
+            {(item["project_key"], item["kind"], item["metric"], item["after"]["period"])
+             for item in blockers})]
+        return {"ready": bool(scopes) and not unresolved and not stale and not blockers,
+                "scope_count": len(scopes), "unresolved": unresolved, "stale_reviews": stale,
+                "blocking_anomalies": [self.service.anomalies.compact(item) for item in blockers],
+                "blocking_anomaly_scopes": anomaly_keys}
+
+    @staticmethod
+    def _scope_key_from_tuple(project_key, kind, metric, period):
+        return {"project_key": project_key, "kind": kind, "metric": metric, "period": period}
+
+    def anomaly_review(self, project_key=None, metric=None, state=None):
+        return self.service.anomalies.queue(project_key, metric, state)
 
     def duplicate_external_ids(self, source_id):
         self.service.store.source(source_id)

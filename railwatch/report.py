@@ -25,7 +25,12 @@ class Reports:
         kinds = self._kinds(kinds)
         scopes = self.service.scopes(project_key)
         selected, unresolved = self._filter(scopes, kinds, start, end)
-        return self._summarize(selected, unresolved, "current")
+        report = self._summarize(selected, unresolved, "current")
+        anomalies = self.service.anomalies.freeze(project_key)
+        report["anomalies"] = self._anomaly_view(anomalies, kinds, start, end)
+        report["anomaly_block_count"] = sum(1 for item in report["anomalies"] if item["blocks_publication"])
+        self._annotate_series(report["series"], report["anomalies"])
+        return report
 
     def snapshot(self, snapshot_id, project_key=None, kinds=None, start=None, end=None):
         snapshot = self.service.snapshot(snapshot_id)
@@ -45,6 +50,11 @@ class Reports:
         report = self._summarize(selected, unresolved, "snapshot")
         report["snapshot_id"] = snapshot_id
         report["snapshot_digest"] = snapshot["digest"]
+        # 异常解释随快照冻结，不按当前阈值或状态重算。
+        frozen = snapshot.get("anomalies", [])
+        report["anomalies"] = self._anomaly_view_frozen(frozen, kinds, start, end)
+        report["anomaly_block_count"] = sum(1 for item in report["anomalies"] if item["blocks_publication"])
+        self._annotate_series(report["series"], report["anomalies"])
         return report
 
     @staticmethod
@@ -75,6 +85,39 @@ class Reports:
             else:
                 selected.append(scope)
         return selected, unresolved
+
+    def _anomaly_view(self, explanations, kinds, start, end):
+        compact = [self.service.anomalies.compact(item) for item in explanations]
+        return self._filter_anomalies(compact, kinds, start, end)
+
+    @staticmethod
+    def _anomaly_view_frozen(frozen, kinds, start, end):
+        return Reports._filter_anomalies(frozen, kinds, start, end)
+
+    @staticmethod
+    def _filter_anomalies(rows, kinds, start, end):
+        result = []
+        for row in rows:
+            if kinds and row["kind"] not in kinds:
+                continue
+            if start and row["after_period"] < start:
+                continue
+            if end and row["before_period"] > end:
+                continue
+            result.append(row)
+        return sorted(result, key=lambda row: (row["project_key"], row["metric"], row["anomaly_id"]))
+
+    @staticmethod
+    def _annotate_series(series, anomalies):
+        for entry in series:
+            key = (entry["project_key"], entry["kind"], entry["metric"], entry["unit"])
+            marks = [row for row in anomalies if (row["project_key"], row["kind"], row["metric"], row["unit"]) == key]
+            entry["anomaly_marks"] = [{"anomaly_id": mark["anomaly_id"], "state": mark["state"],
+                                       "blocks_publication": mark["blocks_publication"],
+                                       "after_period": mark["after_period"],
+                                       "observed_ratio": mark["observed_ratio"],
+                                       "threshold_ratio": mark["threshold_ratio"]} for mark in marks]
+            entry["has_blocking_anomaly"] = any(mark["blocks_publication"] for mark in marks)
 
     def _summarize(self, selected, unresolved, origin):
         numeric = defaultdict(list)
@@ -127,6 +170,20 @@ class Reports:
                             "after": new["selected"] if new else None,
                             "before_version": old["version"] if old else None,
                             "after_version": new["version"] if new else None})
+        anomaly_before = {item["anomaly_id"]: item for item in left.get("anomalies", [])}
+        anomaly_after = {item["anomaly_id"]: item for item in right.get("anomalies", [])}
+        anomaly_changes = []
+        for anomaly_id in sorted(set(anomaly_before) | set(anomaly_after)):
+            old, new = anomaly_before.get(anomaly_id), anomaly_after.get(anomaly_id)
+            if old == new:
+                continue
+            anomaly_changes.append({"anomaly_id": anomaly_id,
+                                    "before_state": old["state"] if old else None,
+                                    "after_state": new["state"] if new else None,
+                                    "before_version": old["version"] if old else None,
+                                    "after_version": new["version"] if new else None})
         return {"left_id": left_id, "right_id": right_id,
                 "left_digest": left["digest"], "right_digest": right["digest"],
-                "changed_scopes": changes, "change_count": len(changes)}
+                "changed_scopes": changes, "change_count": len(changes),
+                "changed_anomalies": anomaly_changes,
+                "anomaly_change_count": len(anomaly_changes)}
